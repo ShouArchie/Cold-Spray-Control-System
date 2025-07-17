@@ -9,7 +9,7 @@ from urx.urrobot import RobotException
 
 # Params
 ROBOT_IP = "192.168.10.223"  # UR10 IP address
-ROT_DEG = 90.0               # ±Ry rotation magnitude (degrees)
+ROT_DEG = 15.0               # ±Ry rotation magnitude (degrees)
 STEP_MM = 50.0               # Y translation distance (millimetres)
 
 # Motion parameters
@@ -17,7 +17,7 @@ ACC = 1.2  # acceleration (m/s² or rad/s²)
 VEL = 0.5  # velocity (m/s or rad/s)
 
 # Starting joint angles (degrees → radians)
-START_JOINTS_DEG = [0, -60, 80, -110, 270, -90]
+START_JOINTS_DEG = [-2.66, -95, 116.5, 253.35, 270, 83.75]
 START_JOINTS = [math.radians(a) for a in START_JOINTS_DEG]
 
 # Precision
@@ -95,30 +95,6 @@ def move_home(robot: urx.Robot):
     wait_until_joints(robot, START_JOINTS)
 
 
-def rotate_ry(robot: urx.Robot, degrees: float):
-    pose = get_tcp_pose(robot)
-    pose[4] += math.radians(degrees)
-    send_movel(robot, pose)
-    wait_until_pose(robot, pose)
-    # Debug output
-    actual = get_tcp_pose(robot)
-    print(
-        f"   ↳ Reached Ry = {math.degrees(actual[4]):.2f}° (target {math.degrees(pose[4]):.2f}°)"
-    )
-
-
-def translate_y(robot: urx.Robot, mm: float):
-    pose = get_tcp_pose(robot)
-    pose[1] += mm / 1000.0  # convert mm → metres
-    send_movel(robot, pose)
-    wait_until_pose(robot, pose)
-    # Debug output
-    actual = get_tcp_pose(robot)
-    print(
-        f"   ↳ Reached Y = {actual[1]*1000:.1f} mm (target {pose[1]*1000:.1f} mm)"
-    )
-
-
 # TCP Helpers
 
 def set_tcp_offset(
@@ -147,6 +123,130 @@ def set_tcp_offset(
         f"rx={rx_deg:.1f}°, ry={ry_deg:.1f}°, rz={rz_deg:.1f}°)"
     )
 
+# --- Orientation Math Helpers -------------------------------------------------
+
+def _aa_to_mat(rx: float, ry: float, rz: float):
+    """Convert axis-angle vector to 3×3 rotation matrix."""
+    theta = math.sqrt(rx * rx + ry * ry + rz * rz)
+    if theta < 1e-12:
+        # Identity rotation
+        return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    kx, ky, kz = rx / theta, ry / theta, rz / theta
+    c = math.cos(theta)
+    s = math.sin(theta)
+    v = 1 - c
+    return [
+        [kx * kx * v + c, kx * ky * v - kz * s, kx * kz * v + ky * s],
+        [ky * kx * v + kz * s, ky * ky * v + c, ky * kz * v - kx * s],
+        [kz * kx * v - ky * s, kz * ky * v + kx * s, kz * kz * v + c],
+    ]
+
+
+def _mat_mul(a, b):
+    """Matrix multiplication for 3×3 matrices."""
+    return [
+        [sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3)]
+        for i in range(3)
+    ]
+
+
+def _mat_to_aa(R):
+    """Convert 3×3 rotation matrix to axis-angle vector."""
+    trace = R[0][0] + R[1][1] + R[2][2]
+    cos_theta = max(min((trace - 1.0) / 2.0, 1.0), -1.0)
+    theta = math.acos(cos_theta)
+    if theta < 1e-12:
+        # Identity rotation
+        return (0.0, 0.0, 0.0)
+    sin_theta = math.sin(theta)
+    rx = (R[2][1] - R[1][2]) / (2.0 * sin_theta) * theta
+    ry = (R[0][2] - R[2][0]) / (2.0 * sin_theta) * theta
+    rz = (R[1][0] - R[0][1]) / (2.0 * sin_theta) * theta
+    return (rx, ry, rz)
+
+
+def _rot_y(angle_rad: float):
+    """Rotation matrix about Y axis by *angle_rad* (right-hand rule)."""
+    c = math.cos(angle_rad)
+    s = math.sin(angle_rad)
+    return [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]]
+
+
+# --- Tool-frame rotation -------------------------------------------------------
+
+def rotate_tcp_y(robot: urx.Robot, degrees: float):
+    """Rotate the tool around **its own Y (green) axis** by *degrees*.
+
+    Unlike simply tweaking the *ry* component of the axis-angle vector (which can
+    give unintuitive results), this utility performs the rotation in proper
+    matrix form so the TCP **position remains unchanged** while the orientation
+    is rotated about the local Y-axis.
+    """
+    # Current pose
+    pose = get_tcp_pose(robot)
+    x, y, z, rx, ry, rz = pose
+
+    # Current orientation → matrix
+    R = _aa_to_mat(rx, ry, rz)
+
+    # Incremental rotation about local Y axis
+    dR = _rot_y(math.radians(degrees))
+
+    # Compose: R_new = R * dR (apply in tool frame)
+    R_new = _mat_mul(R, dR)
+
+    # Back to axis-angle
+    rx_n, ry_n, rz_n = _mat_to_aa(R_new)
+
+    # Send motion with unchanged translation and new orientation
+    new_pose = [x, y, z, rx_n, ry_n, rz_n]
+    send_movel(robot, new_pose)
+    wait_until_pose(robot, new_pose)
+
+    print(
+        f"   ↳ Rotated {degrees:.1f}° about tool Y-axis (green); now Ry component = {math.degrees(ry_n):.2f}°"
+    )
+
+
+def translate_tcp(
+    robot: urx.Robot,
+    dx_mm: float = 0.0,
+    dy_mm: float = 0.0,
+    dz_mm: float = 0.0,
+):
+    """Translate the TCP along its own axes by the specified millimetres.
+
+    Positive X = tool red axis, Y = green, Z = blue (following UR convention).
+    The translation is applied in **tool coordinates**, so the TCP orientation is
+    preserved, and motion feels identical to pendant "Tool → X/Y/Z" jogs.
+    """
+    if dx_mm == dy_mm == dz_mm == 0.0:
+        return  # nothing to do
+
+    # Current pose and orientation matrix
+    pose = get_tcp_pose(robot)
+    x, y, z, rx, ry, rz = pose
+    R = _aa_to_mat(rx, ry, rz)
+
+    # Delta vector in tool frame (→ metres)
+    d_tool = [dx_mm / 1000.0, dy_mm / 1000.0, dz_mm / 1000.0]
+
+    # Convert to base frame: d_base = R * d_tool
+    d_base = [
+        sum(R[i][j] * d_tool[j] for j in range(3)) for i in range(3)
+    ]
+
+    # New Cartesian position in base frame
+    new_pos = [x + d_base[0], y + d_base[1], z + d_base[2]]
+
+    new_pose = new_pos + [rx, ry, rz]
+    send_movel(robot, new_pose)
+    wait_until_pose(robot, new_pose)
+
+    print(
+        f"   ↳ Translated (tool frame) Δx={dx_mm:.1f} mm, Δy={dy_mm:.1f} mm, Δz={dz_mm:.1f} mm"
+    )
+
 
 def main() -> None:
     robot = urx.Robot(ROBOT_IP)
@@ -154,14 +254,14 @@ def main() -> None:
         print(f"✓ Connected to UR10 at {ROBOT_IP}")
         move_home(robot)
 
-        print(f"Rotating +Ry by {ROT_DEG}° …")
-        rotate_ry(robot, +ROT_DEG)
+        # print(f"Rotating +Ry by {ROT_DEG}° …")
+        rotate_tcp_y(robot, +ROT_DEG)
 
-        print(f"Translating -Y by {STEP_MM} mm …")
-        translate_y(robot, -STEP_MM)
+        # print(f"Translating -Y by {STEP_MM} mm …")
+        translate_tcp(robot, dy_mm=-STEP_MM)
 
-        print("Rotating −Ry back …")
-        rotate_ry(robot, -ROT_DEG)
+        # print("Rotating −Ry back …")
+        rotate_tcp_y(robot, -ROT_DEG)
 
         print("✓ Sequence complete")
     finally:
