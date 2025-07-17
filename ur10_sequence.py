@@ -119,7 +119,34 @@ def translate_y(robot: urx.Robot, mm: float):
     )
 
 
-# Main
+# TCP Helpers
+
+def set_tcp_offset(
+    robot: urx.Robot,
+    x_mm: float = 0.0,
+    y_mm: float = 0.0,
+    z_mm: float = 0.0,
+    rx_deg: float = 0.0,
+    ry_deg: float = 0.0,
+    rz_deg: float = 0.0,
+):
+    x = x_mm / 1000.0
+    y = y_mm / 1000.0
+    z = z_mm / 1000.0
+    rx = math.radians(rx_deg)
+    ry = math.radians(ry_deg)
+    rz = math.radians(rz_deg)
+
+    # Apply the new TCP on the controller
+    robot.set_tcp((x, y, z, rx, ry, rz))
+    time.sleep(0.05)
+
+    print(
+        "✓ TCP offset set to "
+        f"(dx={x_mm:.1f} mm, dy={y_mm:.1f} mm, dz={z_mm:.1f} mm, "
+        f"rx={rx_deg:.1f}°, ry={ry_deg:.1f}°, rz={rz_deg:.1f}°)"
+    )
+
 
 def main() -> None:
     robot = urx.Robot(ROBOT_IP)
@@ -141,6 +168,11 @@ def main() -> None:
         print("Stopping motion and closing connection …")
         stop_linear(robot)
         robot.close()
+
+
+
+
+
 
 
 if __name__ == "__main__":
