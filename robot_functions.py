@@ -79,10 +79,32 @@ def wait_until_pose(robot: urx.Robot, target: Sequence[float]) -> None:
             return
         time.sleep(POLL)
 
-def send_movel(robot: urx.Robot, pose: Sequence[float], acc: float = 1.2, vel: float = 0.5):
-    """Send movel command to robot."""
+def send_movel(
+    robot: urx.Robot,
+    pose: Sequence[float],
+    acc: float = 1.2,
+    vel: float = 0.5,
+    blend_mm: float = 0.0,
+):
+    """Send movel command with optional blend radius (mm)."""
     pose_str = ", ".join(f"{v:.6f}" for v in pose)
-    robot.send_program(f"movel(p[{pose_str}], a={acc}, v={vel})")
+    r_part = f", r={blend_mm/1000.0:.4f}" if blend_mm > 0 else ""
+    robot.send_program(f"movel(p[{pose_str}], a={acc}, v={vel}{r_part})")
+
+
+# New helper: joint-interpolated move to pose (lets robot choose minimal joint path)
+
+def send_movej_pose(
+    robot: urx.Robot,
+    pose: Sequence[float],
+    acc: float = 1.2,
+    vel: float = 0.5,
+    blend_mm: float = 0.0,
+):
+    """Send movej command targeting a Cartesian pose (UR will IK to joints) with optional blend radius."""
+    pose_str = ", ".join(f"{v:.6f}" for v in pose)
+    r_part = f", r={blend_mm/1000.0:.4f}" if blend_mm > 0 else ""
+    robot.send_program(f"movej(p[{pose_str}], a={acc}, v={vel}{r_part})")
 
 def stop_linear(robot: urx.Robot, acc: float = 1.2):
     """Stop linear motion."""
@@ -189,6 +211,14 @@ def _rot_z(angle_rad: float):
     s = math.sin(angle_rad)
     return [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]]
 
+# Add new rotation helper about X axis
+
+def _rot_x(angle_rad: float):
+    """Rotation matrix about X axis by angle_rad (right-hand rule)."""
+    c = math.cos(angle_rad)
+    s = math.sin(angle_rad)
+    return [[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]]
+
 # -----------------------------------------------------------------------------
 # Advanced TCP Motion Functions
 # -----------------------------------------------------------------------------
@@ -241,6 +271,32 @@ def rotate_tcp_z(robot: urx.Robot, degrees: float, acc: float = 1.2, vel: float 
         f"   ↳ Rotated {degrees:.1f}° about tool Y-axis (green); now Ry component = {math.degrees(ry_n):.2f}°"
     )
 
+def rotate_tcp_x(robot: urx.Robot, degrees: float, acc: float = 1.2, vel: float = 0.5):
+    """Rotate the tool around its own X (red) axis by degrees."""
+    pose = get_tcp_pose(robot)
+    x, y, z, rx, ry, rz = pose
+
+    # Current orientation → matrix
+    R = _aa_to_mat(rx, ry, rz)
+
+    # Incremental rotation about local X axis
+    dR = _rot_x(math.radians(degrees))
+
+    # Compose: R_new = R * dR (apply in tool frame)
+    R_new = _mat_mul(R, dR)
+
+    # Back to axis-angle
+    rx_n, ry_n, rz_n = _mat_to_aa(R_new)
+
+    # Send motion with unchanged translation and new orientation
+    new_pose = [x, y, z, rx_n, ry_n, rz_n]
+    send_movel(robot, new_pose, acc, vel)
+    wait_until_pose(robot, new_pose)
+
+    print(
+        f"   ↳ Rotated {degrees:.1f}° about tool X-axis (red); now Rx component = {math.degrees(rx_n):.2f}°"
+    )
+
 def translate_tcp(
     robot: urx.Robot,
     dx_mm: float = 0.0,
@@ -277,186 +333,222 @@ def translate_tcp(
         f"   ↳ Translated (tool frame) Δx={dx_mm:.1f} mm, Δy={dy_mm:.1f} mm, Δz={dz_mm:.1f} mm"
     )
 
-def circular_motion_fixed_tcp(
-    robot: urx.Robot, 
-    start_angle: float = -30.0,
-    end_angle: float = 30.0, 
-    num_points: int = 20,
-    tcp_offset_z: float = 60.3,  # Distance from flange to TCP in mm
-    acc: float = 0.5, 
-    vel: float = 0.1
-):
-    """
-    Create circular motion where TCP stays fixed but flange moves in circular arc.
-    
-    The flange traces a circular path in the X-Z plane while TCP remains stationary.
-    This is achieved by rotating around the tool's Y-axis while compensating 
-    the flange position to keep TCP fixed.
-    
-    Args:
-        robot: UR robot instance
-        start_angle: Starting Y-axis rotation angle in degrees
-        end_angle: Ending Y-axis rotation angle in degrees  
-        num_points: Number of points in the circular path
-        tcp_offset_z: Distance from flange to TCP along tool Z-axis in mm
-        acc: Acceleration for movement
-        vel: Velocity for movement
-    """
-    # Get current pose
-    current_pose = get_tcp_pose(robot)
-    tcp_x, tcp_y, tcp_z = current_pose[:3]
-    
-    print(f"Starting circular motion: TCP fixed at [{tcp_x:.3f}, {tcp_y:.3f}, {tcp_z:.3f}]")
-    print(f"Angle range: {start_angle}° to {end_angle}°, {num_points} points")
-    
-    # Calculate angle increment
-    angle_step = (end_angle - start_angle) / (num_points - 1)
-    
-    for i in range(num_points):
-        # Current angle
-        current_angle = start_angle + i * angle_step
-        angle_rad = math.radians(current_angle)
-        
-        # Calculate flange position to keep TCP fixed
-        # Y-axis rotation causes flange to move in X-Z plane (circular arc)
-        offset_z_m = tcp_offset_z / 1000.0  # Convert mm to meters
-        
-        # Flange offset from TCP position
-        flange_x = tcp_x + offset_z_m * math.sin(angle_rad)
-        flange_y = tcp_y  # Y doesn't change for Y-axis rotation
-        flange_z = tcp_z - offset_z_m * math.cos(angle_rad)
-        
-        # Create rotation matrix for current angle
-        c = math.cos(angle_rad)
-        s = math.sin(angle_rad)
-        rot_y_matrix = [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]]
-        
-        # Convert to axis-angle representation
-        # For pure Y rotation: rx=0, ry=angle, rz=0
-        rx_new = 0.0
-        ry_new = angle_rad  
-        rz_new = 0.0
-        
-        # Create target pose
-        target_pose = [flange_x, flange_y, flange_z, rx_new, ry_new, rz_new]
-        
-        # Move to position
-        send_movel(robot, target_pose, acc, vel)
-        wait_until_pose(robot, target_pose)
-        
-        print(f"   Point {i+1}/{num_points}: Angle={current_angle:.1f}°, Flange=[{flange_x:.3f}, {flange_y:.3f}, {flange_z:.3f}]")
-    
-    print("Circular motion complete!")
+# -----------------------------------------------------------------------------
+# Complex Paths – Cone Sweeping
+# -----------------------------------------------------------------------------
 
-def conical_motion_fixed_tcp(
+
+def conical_motion(
     robot: urx.Robot,
-    max_angle: float = 30.0,
-    num_points: int = 20,
-    tcp_offset_x: float = -257.81,  # X offset from flange to TCP in mm
-    tcp_offset_y: float = 0.0,      # Y offset from flange to TCP in mm  
-    tcp_offset_z: float = 60.3,     # Z offset from flange to TCP in mm
-    acc: float = 0.5,
-    vel: float = 0.1,
-    blend_r: float = 0.01  # Blend radius for smooth motion
+    tilt_deg: float = 20.0,
+    revolutions: float = 1.0,
+    steps: int = 72,
+    acc: float = 1.0,
+    vel: float = 0.3,
+    debug: bool = False,
+    avoid_singular: bool = True,
+    sing_tol_deg: float = 15.0,
+    blend_mm: float = 0.0,
 ):
+    """Sweep the tool orientation along a conical surface while **keeping the TCP
+    position fixed** and forcing the tool Z-axis (blue) to always point roughly
+    downward (−Z in base frame).
+
+    The red axis (tool X) traces the generatrix of a cone whose axis is the
+    base −X direction.
     """
-    Create conical motion where TCP stays fixed but tool traces outer surface of cone.
-    
-    The tool orientation rotates in a circle (X and Y axes), tracing the surface of a cone
-    while keeping the TCP position completely stationary. The flange moves in a complex
-    3D path to maintain the fixed TCP.
-    
-    Motion pattern (one full rotation):
-    - Start: Y=-max_angle, X=0
-    - Quarter: Y=0, X=-max_angle  
-    - Half: Y=+max_angle, X=0
-    - Three-quarter: Y=0, X=+max_angle
-    - End: Y=-max_angle, X=0
-    
-    Args:
-        robot: UR robot instance
-        max_angle: Maximum tilt angle in degrees (cone half-angle)
-        num_points: Number of points in the conical path
-        tcp_offset_x: X offset from flange to TCP in mm
-        tcp_offset_y: Y offset from flange to TCP in mm
-        tcp_offset_z: Z offset from flange to TCP in mm
-        acc: Acceleration for movement
-        vel: Velocity for movement
-        blend_r: Blend radius for smooth continuous motion
-    """
-    # Get current pose
-    current_pose = get_tcp_pose(robot)
-    tcp_x, tcp_y, tcp_z = current_pose[:3]
-    base_rx, base_ry, base_rz = current_pose[3:]
-    
-    print(f"Starting conical motion: TCP fixed at [{tcp_x:.3f}, {tcp_y:.3f}, {tcp_z:.3f}]")
-    print(f"Cone half-angle: {max_angle}°, {num_points} points")
-    
-    # Convert TCP offsets to meters
-    offset_x_m = tcp_offset_x / 1000.0
-    offset_y_m = tcp_offset_y / 1000.0
-    offset_z_m = tcp_offset_z / 1000.0
-    
-    for i in range(num_points + 1):  # +1 to complete the circle
-        # Calculate circular parameter (0 to 2π)
-        t = 2 * math.pi * i / num_points
-        
-        # Calculate X and Y rotation angles in a circular pattern
-        angle_rad = math.radians(max_angle)
-        ry_current = angle_rad * math.cos(t)  # Y-axis rotation
-        rx_current = angle_rad * math.sin(t)  # X-axis rotation
-        
-        # Create rotation matrices for X and Y rotations
-        # X rotation matrix
-        cx = math.cos(rx_current)
-        sx = math.sin(rx_current)
-        rot_x = [[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]]
-        
-        # Y rotation matrix  
-        cy = math.cos(ry_current)
-        sy = math.sin(ry_current)
-        rot_y = [[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]]
-        
-        # Combined rotation: R = Ry * Rx (apply X rotation first, then Y)
-        combined_rot = _mat_mul(rot_y, rot_x)
-        
-        # Calculate where flange needs to be to keep TCP fixed
-        # TCP = Flange + R * [offset_x, offset_y, offset_z]
-        # So: Flange = TCP - R * [offset_x, offset_y, offset_z]
-        
-        # Tool vector in rotated frame (apply rotation matrix to tool offset)
-        tool_vector = [
-            combined_rot[0][0] * offset_x_m + combined_rot[0][1] * offset_y_m + combined_rot[0][2] * offset_z_m,
-            combined_rot[1][0] * offset_x_m + combined_rot[1][1] * offset_y_m + combined_rot[1][2] * offset_z_m,
-            combined_rot[2][0] * offset_x_m + combined_rot[2][1] * offset_y_m + combined_rot[2][2] * offset_z_m
+
+    # Capture current TCP position (we'll keep translation fixed)
+    pose = get_tcp_pose(robot)
+    x, y, z, *_ = pose
+
+    axis = (-1.0, 0.0, 0.0)  # cone axis (towards −X)
+    u = (0.0, 0.0, 1.0)      # basis vector ⟂ axis
+    v = (0.0, 1.0, 0.0)      # second basis ⟂ axis
+
+    theta = math.radians(tilt_deg)
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+
+    for i in range(steps + 1):
+        phi = 2 * math.pi * revolutions * i / steps
+        cp, sp = math.cos(phi), math.sin(phi)
+
+        # Direction of tool X (red) on the cone surface
+        X_vec = [
+            cos_t * axis[0] + sin_t * (cp * u[0] + sp * v[0]),
+            cos_t * axis[1] + sin_t * (cp * u[1] + sp * v[1]),
+            cos_t * axis[2] + sin_t * (cp * u[2] + sp * v[2]),
         ]
-        
-        # Calculate flange position
-        flange_x = tcp_x - tool_vector[0]
-        flange_y = tcp_y - tool_vector[1] 
-        flange_z = tcp_z - tool_vector[2]
-        
-        # Convert rotation matrix back to axis-angle
-        rx_new, ry_new, rz_new = _mat_to_aa(combined_rot)
-        
-        # Add base rotations to maintain original orientation offset
-        rx_final = base_rx + rx_new
-        ry_final = base_ry + ry_new  
-        rz_final = base_rz + rz_new
-        
-        # Create target pose
-        target_pose = [flange_x, flange_y, flange_z, rx_final, ry_final, rz_final]
-        
-        # Move to position with blending (except last point)
-        if i < num_points:  # Use blending for all points except the last
-            pose_str = ", ".join(f"{v:.6f}" for v in target_pose)
-            robot.send_program(f"movel(p[{pose_str}], a={acc}, v={vel}, r={blend_r})")
-        else:  # Last point - no blending, wait for completion
-            send_movel(robot, target_pose, acc, vel)
-            wait_until_pose(robot, target_pose)
-        
-        angle_x_deg = math.degrees(rx_current)
-        angle_y_deg = math.degrees(ry_current)
-        print(f"   Point {i+1}/{num_points+1}: X-tilt={angle_x_deg:.1f}°, Y-tilt={angle_y_deg:.1f}°")
-    
-    print("Conical motion complete!")
+        # Normalize (for numerical stability)
+        mag = math.sqrt(sum(c * c for c in X_vec))
+        X_vec = [c / mag for c in X_vec]
+
+        # Aim Z axis roughly downward: pick Y = normalize(Z_down × X)
+        Z_down = (0.0, 0.0, -1.0)
+        Y_vec = [
+            Z_down[1] * X_vec[2] - Z_down[2] * X_vec[1],
+            Z_down[2] * X_vec[0] - Z_down[0] * X_vec[2],
+            Z_down[0] * X_vec[1] - Z_down[1] * X_vec[0],
+        ]
+        mag_y = math.sqrt(sum(c * c for c in Y_vec))
+        if mag_y < 1e-8:
+            # fallback: pick arbitrary perpendicular if cross-product degenerate
+            Y_vec = [0.0, 1.0, 0.0]
+            mag_y = 1.0
+        Y_vec = [c / mag_y for c in Y_vec]
+
+        # Recompute Z to ensure orthonormality (X × Y)
+        Z_vec = [
+            X_vec[1] * Y_vec[2] - X_vec[2] * Y_vec[1],
+            X_vec[2] * Y_vec[0] - X_vec[0] * Y_vec[2],
+            X_vec[0] * Y_vec[1] - X_vec[1] * Y_vec[0],
+        ]
+
+        # Assemble rotation matrix columns (world frame)
+        R = [
+            [X_vec[0], Y_vec[0], Z_vec[0]],
+            [X_vec[1], Y_vec[1], Z_vec[1]],
+            [X_vec[2], Y_vec[2], Z_vec[2]],
+        ]
+
+        # Convert to axis-angle
+        rx_t, ry_t, rz_t = _mat_to_aa(R)
+        target_pose = [x, y, z, rx_t, ry_t, rz_t]
+        # Skip azimuths very close to 90° or 270° if requested
+        if avoid_singular:
+            ang_deg = math.degrees(phi) % 360
+
+            def ang_dist(a, b):
+                """Shortest distance between angles a and b (deg) on a circle."""
+                d = (a - b + 180) % 360 - 180
+                return abs(d)
+
+            if min(ang_dist(ang_deg, 90), ang_dist(ang_deg, 270)) < sing_tol_deg:
+                if debug:
+                    print(
+                        f"  Step {i:>3}/{steps}: phi={ang_deg:.1f}°  — skipped (singularity)"
+                    )
+                continue
+
+        # Use joint-interpolated move to keep solution near current joints
+        send_movej_pose(robot, target_pose, acc, vel, blend_mm=blend_mm)
+        wait_until_pose(robot, target_pose)
+
+        if debug:
+            joints = robot.getj()
+            j_deg = [f"{math.degrees(a):.1f}" for a in joints]
+            print(f"  Step {i:>3}/{steps}: phi={math.degrees(phi):.1f}°  joints={j_deg}")
+
+    print(
+        f"✓ Completed conical sweep with Z-axis down: tilt={tilt_deg}°, revolutions={revolutions}, steps={steps}"
+    )
+
+
+# -----------------------------------------------------------------------------
+# Generic incremental rotation (all three axes)
+# -----------------------------------------------------------------------------
+
+def rotate_tcp(
+    robot: urx.Robot,
+    rx_deg: float = 0.0,
+    ry_deg: float = 0.0,
+    rz_deg: float = 0.0,
+    acc: float = 1.2,
+    vel: float = 0.5,
+):
+    """Incrementally rotate the TCP about its own X, Y and Z axes.
+
+    The rotations are applied in **X → Y → Z** order, all in the TOOL frame,
+    and the TCP translation is unchanged.
+    """
+    if rx_deg == ry_deg == rz_deg == 0.0:
+        return  # nothing to do
+
+    pose = get_tcp_pose(robot)
+    x, y, z, rx, ry, rz = pose
+    R = _aa_to_mat(rx, ry, rz)
+
+    dR_x = _rot_x(math.radians(rx_deg))
+    dR_y = _rot_y(math.radians(ry_deg))
+    dR_z = _rot_z(math.radians(rz_deg))
+
+    # Apply increments in sequence (tool-frame)
+    R_new = _mat_mul(_mat_mul(R, dR_x), _mat_mul(dR_y, dR_z))
+
+    rx_n, ry_n, rz_n = _mat_to_aa(R_new)
+    new_pose = [x, y, z, rx_n, ry_n, rz_n]
+    send_movel(robot, new_pose, acc, vel)
+    wait_until_pose(robot, new_pose)
+
+    print(
+        f"   ↳ Rotated ΔRx={rx_deg:.1f}°, ΔRy={ry_deg:.1f}°, ΔRz={rz_deg:.1f}° (tool frame)"
+    )
+
+# -----------------------------------------------------------------------------
+# Combined tilt + TCP square + spin helper
+# -----------------------------------------------------------------------------
+
+def tilt_and_spin(
+    robot: urx.Robot,
+    tilt_deg: float = 10.0,
+    revolutions: float = 1.0,
+    steps: int = 120,
+    tcp_x_mm: float = -257.81,
+    tcp_y_mm: float = 0.0,
+    tcp_z_mm: float = 60.3,
+    tcp_rx_deg: float = 0.0,
+    tcp_ry_deg: float = 0.0,
+    tcp_rz_deg: float = 0.0,
+    acc: float = 0.5,
+    vel: float = 0.5,
+):
+    """Tilt the tool down by *tilt_deg*, square the TCP, then spin about X.
+
+    1. Rotate around tool Y by ``-tilt_deg`` (tool tips down).
+    2. Add ``+tilt_deg`` to the TCP Ry component so the controller again sees
+       a *level* tool frame.
+    3. Incrementally rotate the tool about its own X-axis, completing the
+       requested number of revolutions.
+
+    Parameters
+    ----------
+    robot : urx.Robot
+    tilt_deg : float
+        Downward tilt angle (positive values tilt toward −Z).
+    revolutions : float
+        How many full 360° turns to perform.
+    steps : int
+        Number of incremental X-axis rotations (higher → smoother).
+    tcp_* : float
+        The TCP offset (in millimetres / degrees) *before* tilting. Only Ry is
+        modified internally; the others are kept as supplied.
+    acc, vel : float
+        Motion parameters for the incremental moves.
+    """
+
+    if steps <= 0:
+        raise ValueError("steps must be positive")
+
+    # 1) Tilt the tool down
+    rotate_tcp_y(robot, degrees=-tilt_deg, acc=acc, vel=vel)
+
+    # 2) Square the TCP by adding +tilt_deg to Ry component
+    rf_ry = tcp_ry_deg + tilt_deg  # new Ry in degrees
+    set_tcp_offset(
+        robot,
+        x_mm=tcp_x_mm,
+        y_mm=tcp_y_mm,
+        z_mm=tcp_z_mm,
+        rx_deg=tcp_rx_deg,
+        ry_deg=rf_ry,
+        rz_deg=tcp_rz_deg,
+    )
+
+    # 3) Spin about tool X in small increments
+    delta = 360.0 * revolutions / steps
+    for _ in range(steps):
+        rotate_tcp_x(robot, degrees=delta, acc=acc, vel=vel)
+
+    print(
+        f"✓ Completed tilt_and_spin: tilt={tilt_deg}°, revolutions={revolutions}, steps={steps}"
+    )
