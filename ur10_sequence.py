@@ -21,9 +21,9 @@ START_JOINTS_DEG = [-2.66, -95, 116.5, 253.35, 270, 83.75]
 START_JOINTS = [math.radians(a) for a in START_JOINTS_DEG]
 
 # Precision
-JOINT_EPS_DEG = 1.0            # joint-angle tolerance in °
-POS_EPS_MM = 0.5               # linear tolerance in mm
-ORI_EPS_DEG = 2.0              # orientation tolerance in °
+JOINT_EPS_DEG = 0.001            # joint-angle tolerance in °
+POS_EPS_MM = 0.001               # linear tolerance in mm
+ORI_EPS_DEG = 0.001              # orientation tolerance in °
 
 # Radian Conversions and values
 JOINT_EPS = math.radians(JOINT_EPS_DEG)
