@@ -552,3 +552,81 @@ def tilt_and_spin(
     print(
         f"✓ Completed tilt_and_spin: tilt={tilt_deg}°, revolutions={revolutions}, steps={steps}"
     )
+
+# -----------------------------------------------------------------------------
+# URScript program generation for conical sweep
+# -----------------------------------------------------------------------------
+
+def conical_motion_script(
+    robot: urx.Robot,
+    tilt_deg: float = 20.0,
+    revolutions: float = 1.0,
+    steps: int = 72,
+    acc: float = 0.1,
+    vel: float = 0.1,
+    blend_mm: float = 1.0,
+    avoid_singular: bool = True,
+    sing_tol_deg: float = 2.0,
+):
+    """Generate and send a single URScript program that performs the conical
+    sweep with constant blend radius.
+
+    This is useful when you want the robot to execute the whole path natively
+    (smooth blending, no round-trip latency).
+    """
+
+    x0, y0, z0, *_ = get_tcp_pose(robot)
+
+    axis = (-1.0, 0.0, 0.0)
+    u = (0.0, 0.0, 1.0)
+    v = (0.0, 1.0, 0.0)
+    theta = math.radians(tilt_deg)
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+
+    blend_m = max(0.0, blend_mm) / 1000.0
+    pts = []
+
+    for i in range(steps + 1):
+        phi = 2 * math.pi * revolutions * i / steps
+        ang = math.degrees(phi) % 360
+        if avoid_singular and min(abs(((ang - 90 + 180) % 360) - 180), abs(((ang - 270 + 180) % 360) - 180)) < sing_tol_deg:
+            continue
+
+        cp, sp = math.cos(phi), math.sin(phi)
+        X = [cos_t*axis[0] + sin_t*(cp*u[0] + sp*v[0]),
+             cos_t*axis[1] + sin_t*(cp*u[1] + sp*v[1]),
+             cos_t*axis[2] + sin_t*(cp*u[2] + sp*v[2])]
+        mag = math.sqrt(sum(c*c for c in X)) or 1.0
+        X = [c/mag for c in X]
+
+        Zdown = (0.0, 0.0, -1.0)
+        Y = [Zdown[1]*X[2]-Zdown[2]*X[1], Zdown[2]*X[0]-Zdown[0]*X[2], Zdown[0]*X[1]-Zdown[1]*X[0]]
+        mag_y = math.sqrt(sum(c*c for c in Y)) or 1.0
+        Y = [c/mag_y for c in Y]
+        Z = [X[1]*Y[2]-X[2]*Y[1], X[2]*Y[0]-X[0]*Y[2], X[0]*Y[1]-X[1]*Y[0]]
+        R = [[X[0], Y[0], Z[0]], [X[1], Y[1], Z[1]], [X[2], Y[2], Z[2]]]
+        rx, ry, rz = _mat_to_aa(R)
+        pts.append([x0, y0, z0, rx, ry, rz])
+
+    lines = ["def cone_path():"]
+    prev = None
+    for idx, p in enumerate(pts):
+        pose_str = ", ".join(f"{v:.6f}" for v in p)
+        if idx == len(pts) - 1 or blend_m == 0.0:
+            # Last point or no blending requested
+            lines.append(f"  movej(p[{pose_str}], a={acc}, v={vel})")
+        else:
+            # Limit blend radius to < half distance to next waypoint (UR requirement)
+            if prev is None:
+                prev = p
+            dist = math.sqrt(sum((p[i]-prev[i])**2 for i in range(3)))  # metres
+            max_r = 0.45 * dist  # leave some margin
+            r_use = min(blend_m, max_r)
+            if r_use < 1e-6:
+                lines.append(f"  movej(p[{pose_str}], a={acc}, v={vel})")
+            else:
+                lines.append(f"  movej(p[{pose_str}], a={acc}, v={vel}, r={r_use:.4f})")
+            prev = p
+    lines.append("end")
+
+    send_urscript(robot, "\n".join(lines))

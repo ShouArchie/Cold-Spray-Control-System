@@ -20,16 +20,15 @@ rf.move_to_joint_position(robot, HOMETest, acc=0.5, vel=0.5)
 rf.translate_tcp(robot, dx_mm=0, dy_mm=0, dz_mm=-400, acc=0.5, vel=0.5)
 
 # Conical sweep keeping blue axis (Z) always downward
-rf.conical_motion(
+rf.conical_motion_script(
     robot,
     tilt_deg=10,        # half-angle of cone
     revolutions=1.0,    # one full spin
-    steps=120,
-    acc=1,
-    vel=1,
-    blend_mm=0.001,
+    steps=60,
+    acc=2,
+    vel=2,
+    blend_mm=20,
     sing_tol_deg=2,
-    debug=True,
 )
 
 
