@@ -628,5 +628,71 @@ def conical_motion_script(
                 lines.append(f"  movej(p[{pose_str}], a={acc}, v={vel}, r={r_use:.4f})")
             prev = p
     lines.append("end")
+    lines.append("cone_path()")
+
+    send_urscript(robot, "\n".join(lines))
+
+# -----------------------------------------------------------------------------
+# URScript program generation with movep (smooth p-curve)
+# -----------------------------------------------------------------------------
+
+def conical_motion_movep_script(
+    robot: urx.Robot,
+    tilt_deg: float = 20.0,
+    revolutions: float = 1.0,
+    steps: int = 72,
+    acc: float = 1.0,
+    vel: float = 0.3,
+    blend_mm: float = 5.0,
+    avoid_singular: bool = True,
+    sing_tol_deg: float = 2.0,
+):
+    """Generate and upload a URScript that executes the conical sweep using
+    movep / movep_add_waypoint for high-smoothness (requires UR SW ≥ 5.10 or any
+    e-Series controller).
+    """
+
+    x0, y0, z0, *_ = get_tcp_pose(robot)
+
+    axis = (-1.0, 0.0, 0.0)
+    u = (0.0, 0.0, 1.0)
+    v = (0.0, 1.0, 0.0)
+    theta = math.radians(tilt_deg)
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+
+    pts = []
+    for i in range(steps + 1):
+        phi = 2 * math.pi * revolutions * i / steps
+        ang = math.degrees(phi) % 360
+        if avoid_singular and min(abs(((ang - 90 + 180) % 360) - 180), abs(((ang - 270 + 180) % 360) - 180)) < sing_tol_deg:
+            continue
+        cp, sp = math.cos(phi), math.sin(phi)
+        X = [cos_t*axis[0] + sin_t*(cp*u[0] + sp*v[0]),
+             cos_t*axis[1] + sin_t*(cp*u[1] + sp*v[1]),
+             cos_t*axis[2] + sin_t*(cp*u[2] + sp*v[2])]
+        mag = math.sqrt(sum(c*c for c in X)) or 1.0
+        X = [c/mag for c in X]
+        Zdown = (0.0, 0.0, -1.0)
+        Y = [Zdown[1]*X[2]-Zdown[2]*X[1], Zdown[2]*X[0]-Zdown[0]*X[2], Zdown[0]*X[1]-Zdown[1]*X[0]]
+        mag_y = math.sqrt(sum(c*c for c in Y)) or 1.0
+        Y = [c/mag_y for c in Y]
+        Z = [X[1]*Y[2]-X[2]*Y[1], X[2]*Y[0]-X[0]*Y[2], X[0]*Y[1]-X[1]*Y[0]]
+        R = [[X[0], Y[0], Z[0]],[X[1], Y[1], Z[1]],[X[2], Y[2], Z[2]]]
+        rx, ry, rz = _mat_to_aa(R)
+        pts.append([x0, y0, z0, rx, ry, rz])
+
+    if len(pts) < 3:
+        raise RuntimeError("movep path needs at least 3 waypoints after skipping singularities")
+
+    r_m = max(0.0, blend_mm) / 1000.0
+    first_pose = ", ".join(f"{v:.6f}" for v in pts[0])
+
+    lines = ["def cone_path():"]
+    lines.append(f"  movep(p[{first_pose}], a={acc}, v={vel}, r={r_m:.4f})")
+    for p in pts[1:]:
+        pose_str = ", ".join(f"{v:.6f}" for v in p)
+        lines.append(f"  movep_add_waypoint(p[{pose_str}])")
+    lines.append("end")
+    lines.append("cone_path()")
 
     send_urscript(robot, "\n".join(lines))
