@@ -334,117 +334,6 @@ def translate_tcp(
     )
 
 # -----------------------------------------------------------------------------
-# Complex Paths – Cone Sweeping
-# -----------------------------------------------------------------------------
-
-
-def conical_motion(
-    robot: urx.Robot,
-    tilt_deg: float = 20.0,
-    revolutions: float = 1.0,
-    steps: int = 72,
-    acc: float = 1.0,
-    vel: float = 0.3,
-    debug: bool = False,
-    avoid_singular: bool = True,
-    sing_tol_deg: float = 15.0,
-    blend_mm: float = 0.0,
-):
-    """Sweep the tool orientation along a conical surface while **keeping the TCP
-    position fixed** and forcing the tool Z-axis (blue) to always point roughly
-    downward (−Z in base frame).
-
-    The red axis (tool X) traces the generatrix of a cone whose axis is the
-    base −X direction.
-    """
-
-    # Capture current TCP position (we'll keep translation fixed)
-    pose = get_tcp_pose(robot)
-    x, y, z, *_ = pose
-
-    axis = (-1.0, 0.0, 0.0)  # cone axis (towards −X)
-    u = (0.0, 0.0, 1.0)      # basis vector ⟂ axis
-    v = (0.0, 1.0, 0.0)      # second basis ⟂ axis
-
-    theta = math.radians(tilt_deg)
-    cos_t, sin_t = math.cos(theta), math.sin(theta)
-
-    for i in range(steps + 1):
-        phi = 2 * math.pi * revolutions * i / steps
-        cp, sp = math.cos(phi), math.sin(phi)
-
-        # Direction of tool X (red) on the cone surface
-        X_vec = [
-            cos_t * axis[0] + sin_t * (cp * u[0] + sp * v[0]),
-            cos_t * axis[1] + sin_t * (cp * u[1] + sp * v[1]),
-            cos_t * axis[2] + sin_t * (cp * u[2] + sp * v[2]),
-        ]
-        # Normalize (for numerical stability)
-        mag = math.sqrt(sum(c * c for c in X_vec))
-        X_vec = [c / mag for c in X_vec]
-
-        # Aim Z axis roughly downward: pick Y = normalize(Z_down × X)
-        Z_down = (0.0, 0.0, -1.0)
-        Y_vec = [
-            Z_down[1] * X_vec[2] - Z_down[2] * X_vec[1],
-            Z_down[2] * X_vec[0] - Z_down[0] * X_vec[2],
-            Z_down[0] * X_vec[1] - Z_down[1] * X_vec[0],
-        ]
-        mag_y = math.sqrt(sum(c * c for c in Y_vec))
-        if mag_y < 1e-8:
-            # fallback: pick arbitrary perpendicular if cross-product degenerate
-            Y_vec = [0.0, 1.0, 0.0]
-            mag_y = 1.0
-        Y_vec = [c / mag_y for c in Y_vec]
-
-        # Recompute Z to ensure orthonormality (X × Y)
-        Z_vec = [
-            X_vec[1] * Y_vec[2] - X_vec[2] * Y_vec[1],
-            X_vec[2] * Y_vec[0] - X_vec[0] * Y_vec[2],
-            X_vec[0] * Y_vec[1] - X_vec[1] * Y_vec[0],
-        ]
-
-        # Assemble rotation matrix columns (world frame)
-        R = [
-            [X_vec[0], Y_vec[0], Z_vec[0]],
-            [X_vec[1], Y_vec[1], Z_vec[1]],
-            [X_vec[2], Y_vec[2], Z_vec[2]],
-        ]
-
-        # Convert to axis-angle
-        rx_t, ry_t, rz_t = _mat_to_aa(R)
-        target_pose = [x, y, z, rx_t, ry_t, rz_t]
-        # Skip azimuths very close to 90° or 270° if requested
-        if avoid_singular:
-            ang_deg = math.degrees(phi) % 360
-
-            def ang_dist(a, b):
-                """Shortest distance between angles a and b (deg) on a circle."""
-                d = (a - b + 180) % 360 - 180
-                return abs(d)
-
-            if min(ang_dist(ang_deg, 90), ang_dist(ang_deg, 270)) < sing_tol_deg:
-                if debug:
-                    print(
-                        f"  Step {i:>3}/{steps}: phi={ang_deg:.1f}°  — skipped (singularity)"
-                    )
-                continue
-
-        # Use joint-interpolated move to keep solution near current joints
-        send_movej_pose(robot, target_pose, acc, vel, blend_mm=blend_mm)
-        wait_until_pose(robot, target_pose)
-
-        if debug:
-            joints = robot.getj()
-            j_deg = [f"{math.degrees(a):.1f}" for a in joints]
-            print(f"  Step {i:>3}/{steps}: phi={math.degrees(phi):.1f}°  joints={j_deg}")
-
-    print(
-        f"✓ Completed conical sweep with Z-axis down: tilt={tilt_deg}°, revolutions={revolutions}, steps={steps}"
-    )
-
-
-# -----------------------------------------------------------------------------
 # Generic incremental rotation (all three axes)
 # -----------------------------------------------------------------------------
 
@@ -483,76 +372,6 @@ def rotate_tcp(
     print(
         f"   ↳ Rotated ΔRx={rx_deg:.1f}°, ΔRy={ry_deg:.1f}°, ΔRz={rz_deg:.1f}° (tool frame)"
     )
-
-# -----------------------------------------------------------------------------
-# Combined tilt + TCP square + spin helper
-# -----------------------------------------------------------------------------
-
-def tilt_and_spin(
-    robot: urx.Robot,
-    tilt_deg: float = 10.0,
-    revolutions: float = 1.0,
-    steps: int = 120,
-    tcp_x_mm: float = -257.81,
-    tcp_y_mm: float = 0.0,
-    tcp_z_mm: float = 60.3,
-    tcp_rx_deg: float = 0.0,
-    tcp_ry_deg: float = 0.0,
-    tcp_rz_deg: float = 0.0,
-    acc: float = 0.5,
-    vel: float = 0.5,
-):
-    """Tilt the tool down by *tilt_deg*, square the TCP, then spin about X.
-
-    1. Rotate around tool Y by ``-tilt_deg`` (tool tips down).
-    2. Add ``+tilt_deg`` to the TCP Ry component so the controller again sees
-       a *level* tool frame.
-    3. Incrementally rotate the tool about its own X-axis, completing the
-       requested number of revolutions.
-
-    Parameters
-    ----------
-    robot : urx.Robot
-    tilt_deg : float
-        Downward tilt angle (positive values tilt toward −Z).
-    revolutions : float
-        How many full 360° turns to perform.
-    steps : int
-        Number of incremental X-axis rotations (higher → smoother).
-    tcp_* : float
-        The TCP offset (in millimetres / degrees) *before* tilting. Only Ry is
-        modified internally; the others are kept as supplied.
-    acc, vel : float
-        Motion parameters for the incremental moves.
-    """
-
-    if steps <= 0:
-        raise ValueError("steps must be positive")
-
-    # 1) Tilt the tool down
-    rotate_tcp_y(robot, degrees=-tilt_deg, acc=acc, vel=vel)
-
-    # 2) Square the TCP by adding +tilt_deg to Ry component
-    rf_ry = tcp_ry_deg + tilt_deg  # new Ry in degrees
-    set_tcp_offset(
-        robot,
-        x_mm=tcp_x_mm,
-        y_mm=tcp_y_mm,
-        z_mm=tcp_z_mm,
-        rx_deg=tcp_rx_deg,
-        ry_deg=rf_ry,
-        rz_deg=tcp_rz_deg,
-    )
-
-    # 3) Spin about tool X in small increments
-    delta = 360.0 * revolutions / steps
-    for _ in range(steps):
-        rotate_tcp_x(robot, degrees=delta, acc=acc, vel=vel)
-
-    print(
-        f"✓ Completed tilt_and_spin: tilt={tilt_deg}°, revolutions={revolutions}, steps={steps}"
-    )
-
 # -----------------------------------------------------------------------------
 # URScript program generation for conical sweep
 # -----------------------------------------------------------------------------
@@ -633,66 +452,77 @@ def conical_motion_script(
     send_urscript(robot, "\n".join(lines))
 
 # -----------------------------------------------------------------------------
-# URScript program generation with movep (smooth p-curve)
+# URScript program generation with servoJ for smooth conical sweep
 # -----------------------------------------------------------------------------
 
-def conical_motion_movep_script(
+def conical_motion_servoj_script(
     robot: urx.Robot,
     tilt_deg: float = 20.0,
     revolutions: float = 1.0,
-    steps: int = 72,
-    acc: float = 1.0,
-    vel: float = 0.3,
-    blend_mm: float = 5.0,
+    steps: int = 720,
+    cycle_s: float = 0.008,
+    lookahead_time: float = 0.1,
+    gain: int = 300,
     avoid_singular: bool = True,
     sing_tol_deg: float = 2.0,
 ):
-    """Generate and upload a URScript that executes the conical sweep using
-    movep / movep_add_waypoint for high-smoothness (requires UR SW ≥ 5.10 or any
-    e-Series controller).
-    """
 
+    # Current TCP position (XYZ only) becomes the apex of the cone
     x0, y0, z0, *_ = get_tcp_pose(robot)
 
-    axis = (-1.0, 0.0, 0.0)
-    u = (0.0, 0.0, 1.0)
+    # Unit vectors for frame construction (same math as *conical_motion_script*)
+    axis = (-1.0, 0.0, 0.0)  # desired mean tool axis (−X in base)
+    u = (0.0, 0.0, 1.0)      # helper vectors to spin around *axis*
     v = (0.0, 1.0, 0.0)
+
     theta = math.radians(tilt_deg)
     cos_t, sin_t = math.cos(theta), math.sin(theta)
 
-    pts = []
+    # Build full list of poses (axis-angle) that realise the cone
+    pts: list[list[float]] = []
     for i in range(steps + 1):
         phi = 2 * math.pi * revolutions * i / steps
         ang = math.degrees(phi) % 360
-        if avoid_singular and min(abs(((ang - 90 + 180) % 360) - 180), abs(((ang - 270 + 180) % 360) - 180)) < sing_tol_deg:
+        if avoid_singular and min(
+            abs(((ang - 90 + 180) % 360) - 180),
+            abs(((ang - 270 + 180) % 360) - 180),
+        ) < sing_tol_deg:
+            # Skip configurations that get too close to wrist singularities
             continue
+
         cp, sp = math.cos(phi), math.sin(phi)
-        X = [cos_t*axis[0] + sin_t*(cp*u[0] + sp*v[0]),
-             cos_t*axis[1] + sin_t*(cp*u[1] + sp*v[1]),
-             cos_t*axis[2] + sin_t*(cp*u[2] + sp*v[2])]
-        mag = math.sqrt(sum(c*c for c in X)) or 1.0
-        X = [c/mag for c in X]
+        X = [
+            cos_t * axis[0] + sin_t * (cp * u[0] + sp * v[0]),
+            cos_t * axis[1] + sin_t * (cp * u[1] + sp * v[1]),
+            cos_t * axis[2] + sin_t * (cp * u[2] + sp * v[2]),
+        ]
+        mag = math.sqrt(sum(c * c for c in X)) or 1.0
+        X = [c / mag for c in X]
+
+        # Orthonormal Y,Z to complete the frame (Z = X × Y, Y chosen so Z≈world −Z)
         Zdown = (0.0, 0.0, -1.0)
-        Y = [Zdown[1]*X[2]-Zdown[2]*X[1], Zdown[2]*X[0]-Zdown[0]*X[2], Zdown[0]*X[1]-Zdown[1]*X[0]]
-        mag_y = math.sqrt(sum(c*c for c in Y)) or 1.0
-        Y = [c/mag_y for c in Y]
-        Z = [X[1]*Y[2]-X[2]*Y[1], X[2]*Y[0]-X[0]*Y[2], X[0]*Y[1]-X[1]*Y[0]]
-        R = [[X[0], Y[0], Z[0]],[X[1], Y[1], Z[1]],[X[2], Y[2], Z[2]]]
+        Y = [
+            Zdown[1] * X[2] - Zdown[2] * X[1],
+            Zdown[2] * X[0] - Zdown[0] * X[2],
+            Zdown[0] * X[1] - Zdown[1] * X[0],
+        ]
+        mag_y = math.sqrt(sum(c * c for c in Y)) or 1.0
+        Y = [c / mag_y for c in Y]
+        Z = [X[1] * Y[2] - X[2] * Y[1], X[2] * Y[0] - X[0] * Y[2], X[0] * Y[1] - X[1] * Y[0]]
+        R = [[X[0], Y[0], Z[0]], [X[1], Y[1], Z[1]], [X[2], Y[2], Z[2]]]
         rx, ry, rz = _mat_to_aa(R)
         pts.append([x0, y0, z0, rx, ry, rz])
 
-    if len(pts) < 3:
-        raise RuntimeError("movep path needs at least 3 waypoints after skipping singularities")
-
-    r_m = max(0.0, blend_mm) / 1000.0
-    first_pose = ", ".join(f"{v:.6f}" for v in pts[0])
-
-    lines = ["def cone_path():"]
-    lines.append(f"  movep(p[{first_pose}], a={acc}, v={vel}, r={r_m:.4f})")
-    for p in pts[1:]:
+    # Assemble URScript program
+    lines = ["def cone_servoj():"]
+    for p in pts:
         pose_str = ", ".join(f"{v:.6f}" for v in p)
-        lines.append(f"  movep_add_waypoint(p[{pose_str}])")
+        lines.append(
+            f"  servoj(get_inverse_kin(p[{pose_str}]), t={cycle_s}, lookahead_time={lookahead_time}, gain={gain})"
+        )
+        lines.append("  sync()")
     lines.append("end")
-    lines.append("cone_path()")
+    lines.append("cone_servoj()")
 
+    # Send program for execution
     send_urscript(robot, "\n".join(lines))
