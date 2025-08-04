@@ -8,7 +8,7 @@ import urx
 from urx.urrobot import RobotException
 
 # Constants and Configuration
-JOINT_EPS_DEG = 1.0            # joint-angle tolerance in °
+JOINT_EPS_DEG = 0.05           # joint-angle tolerance in °
 POS_EPS_MM = 1               # linear tolerance in mm
 ORI_EPS_DEG = 0.1              # orientation tolerance in °
 
@@ -17,7 +17,7 @@ JOINT_EPS = math.radians(JOINT_EPS_DEG)
 POS_EPS = POS_EPS_MM / 1000.0
 ORI_EPS = math.radians(ORI_EPS_DEG)
 POLL = 0.005                    
-TIMEOUT = 60.0                 
+TIMEOUT = 180                 
 
 # -----------------------------------------------------------------------------
 # Robot Connection and Basic Operations
@@ -329,9 +329,9 @@ def translate_tcp(
     send_movel(robot, new_pose, acc, vel)
     wait_until_pose(robot, new_pose)
 
-    print(
-        f"   ↳ Translated (tool frame) Δx={dx_mm:.1f} mm, Δy={dy_mm:.1f} mm, Δz={dz_mm:.1f} mm"
-    )
+    # print(
+    #     f"   ↳ Translated (tool frame) Δx={dx_mm:.1f} mm, Δy={dy_mm:.1f} mm, Δz={dz_mm:.1f} mm"
+    # )
 
 # -----------------------------------------------------------------------------
 # Generic incremental rotation (all three axes)
@@ -369,9 +369,9 @@ def rotate_tcp(
     send_movel(robot, new_pose, acc, vel)
     wait_until_pose(robot, new_pose)
 
-    print(
-        f"   ↳ Rotated ΔRx={rx_deg:.1f}°, ΔRy={ry_deg:.1f}°, ΔRz={rz_deg:.1f}° (tool frame)"
-    )
+    # print(
+    #     f"   ↳ Rotated ΔRx={rx_deg:.1f}°, ΔRy={ry_deg:.1f}°, ΔRz={rz_deg:.1f}° (tool frame)"
+    # )
 # -----------------------------------------------------------------------------
 # URScript program generation for conical sweep
 # -----------------------------------------------------------------------------
@@ -464,7 +464,7 @@ def conical_motion_servoj_script(
     lookahead_time: float = 0.1,
     gain: int = 300,
     avoid_singular: bool = True,
-    sing_tol_deg: float = 2.0,
+    sing_tol_deg: float = 1.0,
 ):
 
     # Current TCP position (XYZ only) becomes the apex of the cone
@@ -526,3 +526,30 @@ def conical_motion_servoj_script(
 
     # Send program for execution
     send_urscript(robot, "\n".join(lines))
+
+
+def wait_until_idle(robot: urx.Robot, eps_rad: float = 0.0005, stable_time: float = 0.15, poll: float = 0.002, timeout: float = TIMEOUT) -> None:
+    """Block until robot has stopped moving (all joints stable).
+
+    This method is controller-agnostic: it simply monitors successive joint
+    positions and waits until they change by < *eps_rad* for at least
+    *stable_time* seconds.  Useful when secmon/program flags are unreliable.
+    """
+    start = time.time()
+    last = robot.getj()
+    stable_start = None
+    while True:
+        cur = robot.getj()
+        if max(abs(c - l) for c, l in zip(cur, last)) < eps_rad:
+            # joints have barely moved since last sample
+            if stable_start is None:
+                stable_start = time.time()
+            elif time.time() - stable_start >= stable_time:
+                return  # stationary long enough
+        else:
+            stable_start = None  # movement resumed
+        if time.time() - start > timeout:
+            print("⚠️  idle wait timeout; continuing")
+            return
+        last = cur
+        time.sleep(poll)
